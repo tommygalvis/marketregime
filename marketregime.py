@@ -119,7 +119,7 @@ print(f"Mean: {(returns.mean() * 252 * 100).round(2).to_dict()}")
 fig, axes = plt.subplots(2, 1, figsize=(14, 10))
 
 # Cumulative returns
-cumulative = (1 + returns).cumprod()
+cumulative = np.exp(returns.cumsum())
 cumulative.plot(ax=axes[0], alpha=0.8)
 axes[0].set_title('Cumulative Returns by Sector', fontsize=14, fontweight='bold')
 axes[0].set_xlabel('')
