@@ -369,22 +369,46 @@ plt.show()
 
 # Regimes are classified from the trailing month of factor returns rather
 # than a single day's return, so they describe periods, not up/down days
-REGIME_WINDOW = 21  # trading days (~1 month)
+REGIME_WINDOW = 21     # trading days (~1 month)
+MIN_TRAIN_DAYS = 252   # first year is only used to fit the first SVD
 
 
 def compute_regime_features(returns: pd.DataFrame, detector: MarketRegimeDetector,
                             window: int = REGIME_WINDOW) -> pd.DataFrame:
-    """Trailing-window factor returns used to classify regimes.
+    """In-sample regime features, using loadings from the full-sample SVD.
 
     Trend    = PC1 return over the window (positive = market rising)
     Rotation = PC2 return over the window (positive = growth beating value)
 
-    Uses raw (uncentered) returns so the sign reflects the actual direction,
-    and each day's value uses only data up to and including that day.
+    The loadings are fit on all dates, so early labels use future data
+    (look-ahead bias). Kept only for comparison with the walk-forward version.
     """
     factor_returns = returns.values @ detector.Vt[:2].T
     factors = pd.DataFrame(factor_returns, index=returns.index, columns=['Trend', 'Rotation'])
     return factors.rolling(window).sum().dropna()
+
+
+def compute_walk_forward_features(returns: pd.DataFrame, growth_idx: list,
+                                  window: int = REGIME_WINDOW,
+                                  min_train: int = MIN_TRAIN_DAYS) -> pd.DataFrame:
+    """Point-in-time regime features with no look-ahead bias.
+
+    On each day, refit the SVD on returns up to and including that day
+    (expanding window), then project the trailing window's returns onto
+    those loadings. Every label could have been computed at that day's close.
+
+    Uses raw (uncentered) returns so the sign reflects the actual direction.
+    """
+    R = returns.values
+    trailing = returns.rolling(window).sum().values
+    start = max(min_train, window) - 1
+
+    rows = []
+    for t in range(start, len(R)):
+        model = MarketRegimeDetector(n_components=2).fit(R[:t + 1], growth_idx=growth_idx)
+        rows.append(trailing[t] @ model.Vt[:2].T)
+
+    return pd.DataFrame(rows, index=returns.index[start:], columns=['Trend', 'Rotation'])
 
 
 def classify_regimes(features: pd.DataFrame) -> pd.Series:
@@ -406,11 +430,17 @@ def classify_regimes(features: pd.DataFrame) -> pd.Series:
     return pd.Series(regimes_arr, index=features.index, name='regime')
 
 
-regime_features = compute_regime_features(returns, detector)
+print(f"\nFitting walk-forward SVD ({len(returns) - MIN_TRAIN_DAYS + 1} daily refits)...")
+regime_features = compute_walk_forward_features(returns, growth_idx)
 regimes = classify_regimes(regime_features)
 regime_returns = returns.loc[regimes.index]
 
-print(f"\nRegimes from trailing {REGIME_WINDOW}-day trend (PC1) and rotation (PC2)")
+# In-sample labels on the same dates, to measure the look-ahead effect
+in_sample_regimes = classify_regimes(compute_regime_features(returns, detector)).loc[regimes.index]
+
+print(f"\nRegimes from trailing {REGIME_WINDOW}-day trend (PC1) and rotation (PC2), "
+      f"walk-forward from {regimes.index[0].date()}")
+print(f"Agreement with full-sample (look-ahead) labels: {(regimes == in_sample_regimes).mean():.1%}")
 print("Regime Distribution:")
 print(regimes.value_counts())
 print(f"\nTotal days: {len(regimes)}")
@@ -642,7 +672,7 @@ def evaluate_forward_returns(returns: pd.DataFrame, regimes: pd.Series,
 
 
 forward_stats = evaluate_forward_returns(returns, regimes)
-print("\nForward Returns by Regime (what happened next):")
+print("\nForward Returns by Regime, walk-forward (what happened next):")
 print("=" * 80)
 print(forward_stats.round(2).to_string())
 
@@ -650,21 +680,42 @@ max_t = forward_stats['t-stat vs All'].abs().max()
 print(f"\nLargest |t-stat| on next-day returns: {max_t:.2f} "
       f"({'notable' if max_t > 2 else 'not significant'}; |t| > 2 is a rough bar for a real effect)")
 
+# Same test with the full-sample (look-ahead) labels on the same dates
+in_sample_stats = evaluate_forward_returns(returns, in_sample_regimes)
+ret_col = f'Next {FORWARD_HORIZON}d Return (%)'
+vol_col = f'Next {FORWARD_HORIZON}d Vol (ann. %)'
+comparison = pd.DataFrame({
+    'Days (WF)': forward_stats['Days'],
+    'Days (IS)': in_sample_stats['Days'],
+    f'Next {FORWARD_HORIZON}d % (WF)': forward_stats[ret_col],
+    f'Next {FORWARD_HORIZON}d % (IS)': in_sample_stats[ret_col],
+    't-stat (WF)': forward_stats['t-stat vs All'],
+    't-stat (IS)': in_sample_stats['t-stat vs All'],
+})
+print("\nLook-ahead check: walk-forward (WF) vs full-sample in-sample (IS) labels, same dates")
+print("=" * 80)
+print(comparison.round(2).to_string())
+
 fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-regime_rows = forward_stats.drop('All days')
-bar_colors = [regime_colors[r] for r in regime_rows.index]
+regime_names = list(forward_stats.drop('All days').index)
+x = np.arange(len(regime_names))
+width = 0.38
+bar_colors = [regime_colors[r] for r in regime_names]
 
 for ax, col, title in [
-    (axes[0], f'Next {FORWARD_HORIZON}d Return (%)', f'Average Return Over the Next {FORWARD_HORIZON} Days'),
-    (axes[1], f'Next {FORWARD_HORIZON}d Vol (ann. %)', f'Volatility Over the Next {FORWARD_HORIZON} Days'),
+    (axes[0], ret_col, f'Average Return Over the Next {FORWARD_HORIZON} Days'),
+    (axes[1], vol_col, f'Volatility Over the Next {FORWARD_HORIZON} Days'),
 ]:
-    ax.bar(regime_rows.index, regime_rows[col], color=bar_colors, edgecolor='white')
+    ax.bar(x - width / 2, forward_stats.loc[regime_names, col], width,
+           color=bar_colors, edgecolor='white', label='Walk-forward')
+    ax.bar(x + width / 2, in_sample_stats.reindex(regime_names)[col], width,
+           color=bar_colors, alpha=0.35, edgecolor='white', hatch='//', label='In-sample (look-ahead)')
     ax.axhline(forward_stats.loc['All days', col], color='black', linestyle='--',
                linewidth=1, label='All days')
+    ax.set_xticks(x, regime_names, fontsize=9)
     ax.set_ylabel(col)
     ax.set_title(title, fontsize=13, fontweight='bold')
-    ax.tick_params(axis='x', labelsize=9)
-    ax.legend()
+    ax.legend(fontsize=9)
 
 plt.tight_layout()
 plt.show()

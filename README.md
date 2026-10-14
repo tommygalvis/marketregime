@@ -9,7 +9,7 @@ Detects market regimes by running Singular Value Decomposition (SVD) on daily lo
 3. Runs SVD (`MarketRegimeDetector`) and reports variance explained and sector loadings per component. SVD signs are arbitrary, so they're fixed after fitting:
    - **PC1 (market factor):** positive when the market rises
    - **PC2 (growth vs value):** positive when growth sectors (Technology, Consumer Discretionary, Communication Services) beat value sectors
-4. Classifies each day into a regime using the trailing 21-day returns of PC1 (trend) and PC2 (rotation):
+4. Classifies each day into a regime using the trailing 21-day returns of PC1 (trend) and PC2 (rotation). The regimes are **walk-forward**: on each day the SVD is refit using only returns up to that day, so every label could have been known at that day's close. The first year of data is used only to fit the first SVD.
 
    | Regime | Trend | Rotation |
    |---|---|---|
@@ -19,7 +19,7 @@ Detects market regimes by running Singular Value Decomposition (SVD) on daily lo
    | Growth Selloff | Market falling | Growth falling hardest |
 
 5. Reports per-regime characteristics, sector performance, transition probabilities, and durations
-6. **Forward-looking test:** measures returns and volatility over the next day and next 21 days after each regime day, with a t-stat for whether a regime's next-day return differs from all days
+6. **Forward-looking test:** measures returns and volatility over the next day and next 21 days after each regime day, with a t-stat for whether a regime's next-day return differs from all days. It also reruns the test with full-sample (look-ahead) labels on the same dates to show how much look-ahead bias would inflate the results.
 7. Runs a rolling 63-day SVD to track market-factor dominance and effective dimensionality
 
 ## Usage
@@ -33,4 +33,5 @@ Charts open in matplotlib windows and the summary statistics print to the consol
 
 ## Limitations
 
-The SVD is fit on the full sample, so regime labels for early dates use information from later dates (look-ahead bias). Refit on an expanding or rolling window before using the regimes in a backtest.
+- The forward 21-day windows overlap, so the 21-day columns overstate how many independent observations there are. Measuring from the first day of each regime episode gives a smaller but more honest sample.
+- The descriptive sections (loadings, PC space, rolling SVD) still use the full-sample SVD. That's fine for describing the past, but only the walk-forward regimes are suitable for backtesting.
