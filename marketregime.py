@@ -9,6 +9,7 @@ regimes using Singular Value Decomposition (SVD) on sector ETF returns.
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 import seaborn as sns
 import yfinance as yf
 from scipy import stats  # kept for potential extensions
@@ -45,9 +46,9 @@ SECTOR_ETFS = {
     'XLC': 'Communication Services'
 }
 
-# Date range: Last 3 years of data
+# Date range: Last 6 years of data
 END_DATE = datetime.now()
-START_DATE = END_DATE - timedelta(days=3 * 365)
+START_DATE = END_DATE - timedelta(days=6 * 365)
 
 print(f"Fetching data from {START_DATE.date()} to {END_DATE.date()}")
 print(f"Sectors: {list(SECTOR_ETFS.values())}")
@@ -180,14 +181,29 @@ class MarketRegimeDetector:
         self.explained_variance_ratio = None
         self.projections = None
 
-    def fit(self, returns: np.ndarray) -> 'MarketRegimeDetector':
-        """Perform SVD on the returns matrix."""
+    def fit(self, returns: np.ndarray, growth_idx: list = None) -> 'MarketRegimeDetector':
+        """Perform SVD on the returns matrix.
+
+        Args:
+            returns: (days x assets) matrix of returns
+            growth_idx: column indices of growth sectors, used to orient PC2
+        """
         # Center the data
         self.mean = returns.mean(axis=0)
         centered = returns - self.mean
 
         # Full SVD decomposition
         self.U, self.S, self.Vt = np.linalg.svd(centered, full_matrices=False)
+
+        # SVD signs are arbitrary and can flip between runs, so fix them:
+        # PC1 points in the "market up" direction, and PC2 is positive
+        # when growth sectors outperform
+        signs = np.sign(self.Vt.sum(axis=1))
+        if growth_idx is not None:
+            signs[1] = np.sign(self.Vt[1, growth_idx].sum())
+        signs[signs == 0] = 1
+        self.Vt *= signs[:, None]
+        self.U *= signs
 
         # Explained variance ratios
         variance = self.S ** 2
@@ -213,15 +229,24 @@ class MarketRegimeDetector:
         return 1 - float(self.explained_variance_ratio[:k].sum())
 
 
+# Growth sectors define the positive direction of PC2 (growth vs value)
+GROWTH_SECTORS = ['Technology', 'Consumer Discretionary', 'Communication Services']
+
 R = returns.values
+growth_idx = [returns.columns.get_loc(s) for s in GROWTH_SECTORS]
 detector = MarketRegimeDetector(n_components=3)
-detector.fit(R)
+detector.fit(R, growth_idx=growth_idx)
 
 print("\nSVD Decomposition Complete")
 print(f"Returns matrix shape: {R.shape}")
 print(f"U shape: {detector.U.shape}")
 print(f"S shape: {detector.S.shape}")
 print(f"Vt shape: {detector.Vt.shape}")
+
+# PC2's meaning depends on the data window, so show what it is
+pc2 = pd.Series(detector.Vt[1], index=returns.columns).sort_values()
+print(f"\nPC2 positive side: {', '.join(pc2.index[-3:][::-1])}")
+print(f"PC2 negative side: {', '.join(pc2.index[:3])}")
 
 # ---------------------------------------------------------------------
 # 5. Variance Analysis & Loadings
@@ -312,7 +337,7 @@ scatter = axes[0].scatter(
 axes[0].axhline(y=0, color='gray', linestyle='--', alpha=0.3)
 axes[0].axvline(x=0, color='gray', linestyle='--', alpha=0.3)
 axes[0].set_xlabel('PC1 (Market Factor)')
-axes[0].set_ylabel('PC2 (Rotation Factor)')
+axes[0].set_ylabel('PC2 (Growth vs Value)')
 axes[0].set_title('Market Days in Principal Component Space', fontsize=14, fontweight='bold')
 
 cbar = plt.colorbar(scatter, ax=axes[0])
@@ -342,36 +367,60 @@ plt.show()
 # ---------------------------------------------------------------------
 
 
-def classify_regimes(projections: pd.DataFrame) -> pd.Series:
-    """Classify market days into regimes based on PC1 and PC2 quadrants."""
-    pc1_median = projections['PC1'].median()
-    pc2_median = projections['PC2'].median()
+# Regimes are classified from the trailing month of factor returns rather
+# than a single day's return, so they describe periods, not up/down days
+REGIME_WINDOW = 21  # trading days (~1 month)
+
+
+def compute_regime_features(returns: pd.DataFrame, detector: MarketRegimeDetector,
+                            window: int = REGIME_WINDOW) -> pd.DataFrame:
+    """Trailing-window factor returns used to classify regimes.
+
+    Trend    = PC1 return over the window (positive = market rising)
+    Rotation = PC2 return over the window (positive = growth beating value)
+
+    Uses raw (uncentered) returns so the sign reflects the actual direction,
+    and each day's value uses only data up to and including that day.
+    """
+    factor_returns = returns.values @ detector.Vt[:2].T
+    factors = pd.DataFrame(factor_returns, index=returns.index, columns=['Trend', 'Rotation'])
+    return factors.rolling(window).sum().dropna()
+
+
+def classify_regimes(features: pd.DataFrame) -> pd.Series:
+    """Classify each day by the signs of its trailing trend and rotation."""
+    up = features['Trend'] >= 0
+    growth_leads = features['Rotation'] >= 0
 
     conditions = [
-        (projections['PC1'] >= pc1_median) & (projections['PC2'] >= pc2_median),
-        (projections['PC1'] >= pc1_median) & (projections['PC2'] < pc2_median),
-        (projections['PC1'] < pc1_median) & (projections['PC2'] >= pc2_median),
-        (projections['PC1'] < pc1_median) & (projections['PC2'] < pc2_median),
+        up & growth_leads,
+        up & ~growth_leads,
+        ~up & growth_leads,
+        ~up & ~growth_leads,
     ]
 
-    regime_names = ['Risk-On Rally', 'Defensive Rally', 'Risk-Off Stress', 'Broad Decline']
+    # A selloff is named after the side falling hardest
+    regime_names = ['Growth Rally', 'Value Rally', 'Value Selloff', 'Growth Selloff']
 
     regimes_arr = np.select(conditions, regime_names, default='')
-    return pd.Series(regimes_arr, index=projections.index, name='regime')
+    return pd.Series(regimes_arr, index=features.index, name='regime')
 
 
-regimes = classify_regimes(projections_df)
+regime_features = compute_regime_features(returns, detector)
+regimes = classify_regimes(regime_features)
+regime_returns = returns.loc[regimes.index]
 
+print(f"\nRegimes from trailing {REGIME_WINDOW}-day trend (PC1) and rotation (PC2)")
 print("Regime Distribution:")
 print(regimes.value_counts())
 print(f"\nTotal days: {len(regimes)}")
 
 # Regime visualization
 regime_colors = {
-    'Risk-On Rally': '#2ecc71',
-    'Defensive Rally': '#3498db',
-    'Risk-Off Stress': '#e74c3c',
-    'Broad Decline': '#9b59b6'
+    'Growth Rally': '#2ecc71',
+    'Value Rally': '#3498db',
+    'Value Selloff': '#9b59b6',
+    'Growth Selloff': '#e74c3c',
 }
 
 fig, axes = plt.subplots(1, 2, figsize=(14, 6))
@@ -380,38 +429,34 @@ fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 for regime_name, color in regime_colors.items():
     mask = regimes == regime_name
     axes[0].scatter(
-        projections_df.loc[mask, 'PC1'],
-        projections_df.loc[mask, 'PC2'],
+        regime_features.loc[mask, 'Trend'],
+        regime_features.loc[mask, 'Rotation'],
         c=color,
         label=regime_name,
         alpha=0.6,
-        s=20
+        s=12
     )
 
-axes[0].axhline(y=projections_df['PC2'].median(), color='gray', linestyle='--', alpha=0.5)
-axes[0].axvline(x=projections_df['PC1'].median(), color='gray', linestyle='--', alpha=0.5)
-axes[0].set_xlabel('PC1 (Market Factor)')
-axes[0].set_ylabel('PC2 (Rotation Factor)')
-axes[0].set_title('Market Regimes in PC Space', fontsize=14, fontweight='bold')
+axes[0].axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+axes[0].axvline(x=0, color='gray', linestyle='--', alpha=0.5)
+axes[0].set_xlabel(f'Trend: PC1 return, trailing {REGIME_WINDOW} days')
+axes[0].set_ylabel(f'Rotation: PC2 return, trailing {REGIME_WINDOW} days')
+axes[0].set_title('Market Regimes in Factor Space', fontsize=14, fontweight='bold')
 axes[0].legend()
 
-# Regime timeline
-regime_numeric = regimes.map({name: i for i, name in enumerate(regime_colors.keys())})
-for i, (regime_name, color) in enumerate(regime_colors.items()):
-    mask = regimes == regime_name
-    axes[1].scatter(
-        regimes.index[mask],
-        regime_numeric[mask],
-        c=color,
-        s=10,
-        label=regime_name,
-        alpha=0.7
-    )
+# Regime timeline: equal-weight sector portfolio with regimes shaded behind it
+portfolio_curve = np.exp(regime_returns.mean(axis=1).cumsum())
+axes[1].plot(portfolio_curve.index, portfolio_curve.values, color='black', linewidth=1)
 
+starts = regimes.index[regimes != regimes.shift()]
+ends = list(starts[1:]) + [regimes.index[-1]]
+for start, end in zip(starts, ends):
+    axes[1].axvspan(start, end, color=regime_colors[regimes[start]], alpha=0.3, linewidth=0)
+
+axes[1].legend(handles=[Patch(color=c, alpha=0.5, label=n) for n, c in regime_colors.items()],
+               loc='upper left', fontsize=9)
 axes[1].set_xlabel('Date')
-axes[1].set_ylabel('Regime')
-axes[1].set_yticks(range(len(regime_colors)))
-axes[1].set_yticklabels(list(regime_colors.keys()))
+axes[1].set_ylabel('Equal-Weight Sector Portfolio')
 axes[1].set_title('Regime Timeline', fontsize=14, fontweight='bold')
 
 plt.tight_layout()
@@ -456,8 +501,8 @@ def compute_regime_metrics(returns: pd.DataFrame, regimes: pd.Series) -> pd.Data
     return pd.DataFrame(metrics).set_index('Regime')
 
 
-regime_metrics = compute_regime_metrics(returns, regimes)
-print("\nRegime Characteristics:")
+regime_metrics = compute_regime_metrics(regime_returns, regimes)
+print("\nRegime Characteristics (same days; descriptive, not predictive):")
 print("=" * 80)
 print(regime_metrics.round(2).to_string())
 
@@ -467,9 +512,8 @@ axes = axes.flatten()
 
 for i, regime in enumerate(regime_colors.keys()):
     mask = regimes == regime
-    regime_returns = returns[mask]
 
-    ann_returns = regime_returns.mean() * 252 * 100
+    ann_returns = regime_returns[mask].mean() * 252 * 100
     colors_sect = ['#2ecc71' if r > 0 else '#e74c3c' for r in ann_returns]
 
     ann_returns.plot(kind='barh', ax=axes[i], color=colors_sect, edgecolor='white')
@@ -555,7 +599,78 @@ print("=" * 60)
 print(duration_df.round(1).to_string())
 
 # ---------------------------------------------------------------------
-# 10. Rolling SVD Analysis
+# 10. Forward-Looking Test: Does the Regime Predict Anything?
+# ---------------------------------------------------------------------
+
+FORWARD_HORIZON = 21  # trading days
+
+
+def evaluate_forward_returns(returns: pd.DataFrame, regimes: pd.Series,
+                             horizon: int = FORWARD_HORIZON) -> pd.DataFrame:
+    """Measure what happened AFTER each regime day, using the equal-weight
+    sector portfolio. This is the real test of a regime signal.
+
+    Next-day returns don't overlap, so their t-stat (regime vs all days) is a
+    fair significance check. Forward windows overlap, so treat the
+    multi-day columns as descriptive.
+    """
+    portfolio = returns.mean(axis=1)
+    data = pd.DataFrame({
+        'regime': regimes,
+        'next_day': portfolio.shift(-1),
+        'fwd_ret': portfolio.rolling(horizon).sum().shift(-horizon),
+        'fwd_vol': portfolio.rolling(horizon).std().shift(-horizon) * np.sqrt(252),
+    }).dropna()
+
+    rows = []
+    for name, group in [*data.groupby('regime'), ('All days', data)]:
+        next_day = group['next_day']
+        t_stat = ((next_day.mean() - data['next_day'].mean())
+                  / (next_day.std() / np.sqrt(len(next_day))))
+        rows.append({
+            'Regime': name,
+            'Days': len(group),
+            'Next-Day Return (bps)': next_day.mean() * 10000,
+            't-stat vs All': t_stat if name != 'All days' else np.nan,
+            f'Next {horizon}d Return (%)': group['fwd_ret'].mean() * 100,
+            f'Next {horizon}d Up (%)': (group['fwd_ret'] > 0).mean() * 100,
+            f'Next {horizon}d Vol (ann. %)': group['fwd_vol'].mean() * 100,
+        })
+
+    order = [r for r in regime_colors if r in data['regime'].values] + ['All days']
+    return pd.DataFrame(rows).set_index('Regime').loc[order]
+
+
+forward_stats = evaluate_forward_returns(returns, regimes)
+print("\nForward Returns by Regime (what happened next):")
+print("=" * 80)
+print(forward_stats.round(2).to_string())
+
+max_t = forward_stats['t-stat vs All'].abs().max()
+print(f"\nLargest |t-stat| on next-day returns: {max_t:.2f} "
+      f"({'notable' if max_t > 2 else 'not significant'}; |t| > 2 is a rough bar for a real effect)")
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+regime_rows = forward_stats.drop('All days')
+bar_colors = [regime_colors[r] for r in regime_rows.index]
+
+for ax, col, title in [
+    (axes[0], f'Next {FORWARD_HORIZON}d Return (%)', f'Average Return Over the Next {FORWARD_HORIZON} Days'),
+    (axes[1], f'Next {FORWARD_HORIZON}d Vol (ann. %)', f'Volatility Over the Next {FORWARD_HORIZON} Days'),
+]:
+    ax.bar(regime_rows.index, regime_rows[col], color=bar_colors, edgecolor='white')
+    ax.axhline(forward_stats.loc['All days', col], color='black', linestyle='--',
+               linewidth=1, label='All days')
+    ax.set_ylabel(col)
+    ax.set_title(title, fontsize=13, fontweight='bold')
+    ax.tick_params(axis='x', labelsize=9)
+    ax.legend()
+
+plt.tight_layout()
+plt.show()
+
+# ---------------------------------------------------------------------
+# 11. Rolling SVD Analysis
 # ---------------------------------------------------------------------
 
 
@@ -620,7 +735,7 @@ print("- Low effective dimension → Market dominated by few factors (stress)")
 print("- High effective dimension → Diversified returns, sector-specific moves")
 
 # ---------------------------------------------------------------------
-# 11. Summary & Conclusions
+# 12. Summary & Conclusions
 # ---------------------------------------------------------------------
 
 print("=" * 80)
@@ -634,10 +749,13 @@ print(f"\nPrincipal Component Analysis:")
 print(f"  - PC1 explains {detector.explained_variance_ratio[0]*100:.1f}% of variance (market factor)")
 print(f"  - Top 3 PCs explain {detector.explained_variance_ratio[:3].sum()*100:.1f}% of variance")
 
-print("\nRegime Statistics:")
-for regime_name, row in regime_metrics.sort_index().iterrows():
-    print(f"  - {regime_name}: {row['Frequency (%)']:.1f}% of days, "
-          f"Sharpe: {row['Sharpe Ratio']:.2f}")
+print(f"\nRegime Statistics (next {FORWARD_HORIZON} days after each regime day):")
+for regime_name, row in forward_stats.drop('All days').iterrows():
+    print(f"  - {regime_name}: {regime_metrics.loc[regime_name, 'Frequency (%)']:.1f}% of days, "
+          f"next {FORWARD_HORIZON}d return {row[f'Next {FORWARD_HORIZON}d Return (%)']:+.2f}%, "
+          f"next-day t-stat {row['t-stat vs All']:+.2f}")
+all_days = forward_stats.loc['All days']
+print(f"  - All days: next {FORWARD_HORIZON}d return {all_days[f'Next {FORWARD_HORIZON}d Return (%)']:+.2f}%")
 
 avg_duration = duration_df['Avg Duration (days)'].mean()
 max_persistence = transition_matrix.values.diagonal().max()
